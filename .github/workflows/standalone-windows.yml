@@ -1,0 +1,118 @@
+name: Standalone Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [build/standalone-windows]
+    paths:
+      - '.github/workflows/standalone-windows.yml'
+      - 'standalone/CMakeLists.txt'
+      - 'examples/libtorrent.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install static Boost and OpenSSL
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP/vcpkg"
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & "$env:RUNNER_TEMP/vcpkg/vcpkg.exe" install boost-headers:x64-windows-static openssl:x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+
+      - name: Configure
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arguments = @(
+            '-S', 'standalone', '-B', 'build-standalone',
+            '-G', 'Visual Studio 17 2022', '-A', 'x64',
+            "-DCMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            '-DVCPKG_TARGET_TRIPLET=x64-windows-static',
+            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+            '-DCMAKE_CXX_STANDARD=17',
+            '-DOPENSSL_USE_STATIC_LIBS=ON',
+            '-DBoost_USE_STATIC_LIBS=ON',
+            '-DBUILD_SHARED_LIBS=OFF',
+            '-Dstatic_runtime=ON',
+            '-Dwebtorrent=OFF'
+          )
+          & cmake @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+
+      - name: Build
+        run: |
+          cmake --build build-standalone --config Release --target libtorrent --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'CMake build failed' }
+
+      - name: Test Unicode, v2, hybrid and aligned v1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path (Get-Location) 'build-standalone/Release/libtorrent.exe'
+          if (-not (Test-Path $exe)) { throw "Missing executable $exe" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Version test failed' }
+          $sample = Join-Path $env:RUNNER_TEMP 'torrent-样本'
+          New-Item -ItemType Directory -Path $sample -Force | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $sample '甲-一.bin'), (New-Object byte[] 110003))
+          [IO.File]::WriteAllBytes((Join-Path $sample '乙-二.bin'), (New-Object byte[] 1800099))
+          foreach ($mode in @('v2','hybrid','v1-aligned')) {
+            $output = Join-Path $env:RUNNER_TEMP "test-$mode.torrent"
+            & $exe create $sample --mode $mode --piece-mib 1 --output $output
+            if ($LASTEXITCODE -ne 0) { throw "Create $mode failed" }
+            & $exe verify $output --mode $mode
+            if ($LASTEXITCODE -ne 0) { throw "Verify $mode failed" }
+          }
+
+      - name: Package and dependency check
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path (Get-Location) 'build-standalone/Release/libtorrent.exe'
+          $pkg = Join-Path (Get-Location) 'release'
+          New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+          Copy-Item $exe (Join-Path $pkg 'libtorrent.exe')
+          Copy-Item 'LICENSE' (Join-Path $pkg 'LICENSE-libtorrent.txt')
+          $readme = @(
+            'Standalone Windows Torrent Creator (libtorrent 2.x)',
+            'No Python is needed. Copy libtorrent.exe to C:\Program Files\libtorrent.',
+            'Use --help to view all options.',
+            'Example:',
+            'libtorrent.exe create "D:\Source Folder" --mode v2 --piece-mib 4 --output "D:\output.v2.torrent"',
+            'libtorrent.exe create "D:\Source Folder" --mode hybrid --output "D:\output.hybrid.torrent"',
+            'libtorrent.exe verify "D:\output.v2.torrent" --mode v2'
+          )
+          $readme | Set-Content (Join-Path $pkg 'README.txt') -Encoding UTF8
+          $sha = (Get-FileHash $exe -Algorithm SHA256).Hash
+          "SHA256 libtorrent.exe $sha" | Set-Content (Join-Path $pkg 'SHA256.txt') -Encoding ascii
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1 -ExpandProperty FullName
+          if ($dumpbin) {
+            $imports = & $dumpbin /dependents $exe
+            if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed' }
+            $imports | Set-Content (Join-Path $pkg 'DEPENDENCIES.txt') -Encoding UTF8
+            foreach ($name in @('torrent-rasterbar.dll', 'libssl-3-x64.dll', 'libcrypto-3-x64.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+              if ($imports -match [regex]::Escape($name)) { throw "Non-static third-party dependency: $name" }
+            }
+          }
+          Compress-Archive -Path (Join-Path $pkg '*') -DestinationPath libtorrent-windows-x64.zip -Force
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtorrent-windows-x64
+          path: libtorrent-windows-x64.zip
+          retention-days: 30
+          if-no-files-found: error
